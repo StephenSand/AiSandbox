@@ -1,0 +1,178 @@
+### Installation ###
+
+## Make sure you have docker installed ##
+
+## Make a new directory and cd into it ##
+
+## Make a directory called data ##
+mkdir data
+
+## Make a new docker-compose.yml file with the following: ##
+version: '0.1'
+
+services:
+  neo4j:
+    image: neo4j:latest
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password  # Replace 'password' with your desired password
+    volumes:
+      - neo4j_data:/data
+
+  python:
+    build: .
+    volumes:
+      - .:/app
+    depends_on:
+      - neo4j
+
+volumes:
+  neo4j_data:
+
+## Make a new Dockerfile with this in it: ##
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+RUN apt update && apt install build-essential git -y
+RUN pip install --no-cache-dir neo4j neo4j-graphrag langchain langchain-community langchain_neo4j langgraph huggingface-hub llama-cpp-python
+
+COPY . .
+
+
+## Run docker compose up in the dir with your yml file##
+docker-compose up -d
+
+## If you want the requirements.txt, get into container bash and pip freeze then copy paste ##
+docker run -it aisandbox-python /bin/bash
+pip freeze
+
+## Get into the py terminal in your py container (find it with docker images) ##
+docker run -it aisandbox-python
+
+## Run py shell (make sure instead of localhost you use 172.17.0.1) ##
+from neo4j import GraphDatabase
+
+driver = GraphDatabase.driver("bolt://172.17.0.1:7687", auth=("neo4j", "password"))
+
+session = driver.session()
+session.run("CREATE (potato:Vegetable {name: 'Mr. Potato'})")
+print(session.run("MATCH (n) RETURN n.name").data())
+session.run("MATCH (n) DETACH DELETE n") #new
+
+driver.close()
+
+
+# helpful notes
+# list containers
+#	# docker ps
+# list images
+#	# docker images
+# stop container
+#	# docker container stop <containerid>
+# remove container
+#	# docker container rm <containerid>
+# run bash
+#	# docker run -it <image> /bin/bash
+# remove all containers
+# 	# docker rm -vf $(docker ps -aq)
+# remove all images
+#	# docker rmi -f $(docker images -aq)
+
+### langchain RAG with neo4j & llama.cpp ###
+## Download the llm model ##
+from llama_cpp import Llama
+llama = Llama.from_pretrained(
+    repo_id="NousResearch/Hermes-2-Pro-Llama-3-8B-GGUF",
+    filename="*Q4_K_M.gguf",
+    local_dir="/app/",
+    verbose=False
+)
+## Make the llm for langchain ##
+from langchain_community.llms import LlamaCpp
+from langchain_core.callbacks import CallbackManager, StreamingStdOutCallbackHandler
+#from langchain_core.prompts import PromptTemplate
+#template = """Question: {question}
+#Answer: Let's work this out in a step by step way to be sure we have the right answer."""
+#prompt = PromptTemplate.from_template(template)
+
+# Callbacks support token-wise streaming
+callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
+# Make sure the model path is correct for your system!
+llm = LlamaCpp(
+    model_path="./Hermes-2-Pro-Llama-3-8B-Q4_K_M.gguf",
+    callback_manager=callback_manager,
+    n_ctx=2048,
+    verbose=True,  # Verbose is required to pass to the callback manager
+) # if desired can add temperature=0.75, max_tokens=2000, top_p=1,
+
+
+## Make the llama embeddings model ##
+from langchain_community.embeddings import LlamaCppEmbeddings
+embeddings = LlamaCppEmbeddings(model_path="./Hermes-2-Pro-Llama-3-8B-Q4_K_M.gguf")
+
+## Make the vector store ##
+from langchain_community.document_loaders import TextLoader
+from langchain_core.documents import Document
+from langchain_neo4j import Neo4jVector
+from langchain_text_splitters import CharacterTextSplitter
+# Here we have to load some text ("pickles.txt") which I got off the internet
+pickles = """paste pickles in here"""
+with open("pickles.txt","w") as f: f.write(pickles)
+
+loader = TextLoader("./pickles.txt")
+documents = loader.load()
+text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+docs = text_splitter.split_documents(documents)
+
+url = "bolt://172.17.0.1:7687"
+username = "neo4j"
+password = "password"
+db = Neo4jVector.from_documents(
+    docs, embeddings, url=url, username=username, password=password
+)
+
+## Retrieval & Generation without LangGraph ##
+from langchain import hub
+prompt = hub.pull("rlm/rag-prompt")
+#example_messages = prompt.invoke(
+#    {"context": "(context goes here)", "question": "(question goes here)"}
+#).to_messages()
+
+question = "Tell me what pickles are made from."
+
+retrieved_docs = db.similarity_search(question)
+docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
+prompt = prompt.invoke({"question": question, "context": docs_content})
+answer = llm.invoke(prompt)
+
+## Retrieval & Generation with LangGraph ##
+from langchain_core.documents import Document
+from typing_extensions import List, TypedDict
+
+class State(TypedDict):
+    question: str
+    context: List[Document]
+    answer: str
+
+def retrieve(state: State):
+    retrieved_docs = db.similarity_search(state["question"])
+    return {"context": retrieved_docs}
+
+def generate(state: State):
+    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    messages = prompt.invoke({"question": state["question"], "context": docs_content})
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+from langgraph.graph import START, StateGraph
+
+graph_builder = StateGraph(State).add_sequence([retrieve, generate])
+graph_builder.add_edge(START, "retrieve")
+graph = graph_builder.compile()
+
+result = graph.invoke({"question": "What is Task Decomposition?"})
+print(f'Context: {result["context"]}\n\n')
+print(f'Answer: {result["answer"]}')
